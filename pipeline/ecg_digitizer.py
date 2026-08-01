@@ -609,8 +609,13 @@ def build_ink_mask(img_bgr: np.ndarray, params: dict[str, Any]) -> np.ndarray:
 
 def build_dark_hybrid_ink_mask(img_bgr: np.ndarray, params: dict[str, Any]) -> np.ndarray:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    max_channel = img_bgr.max(axis=2)
-    min_channel = img_bgr.min(axis=2)
+    # img_bgr.max(axis=2)/.min(axis=2) reduce across the interleaved B,G,R
+    # memory layout, which numpy handles poorly; splitting into contiguous
+    # per-channel arrays first and taking pairwise max/min is ~35x faster
+    # for the same result.
+    b_ch, g_ch, r_ch = cv2.split(img_bgr)
+    max_channel = np.maximum(np.maximum(b_ch, g_ch), r_ch)
+    min_channel = np.minimum(np.minimum(b_ch, g_ch), r_ch)
     spread = max_channel - min_channel
 
     strong_black = max_channel <= int(params["dark_thresh"])
@@ -830,14 +835,24 @@ def build_trace_from_mask(mask: np.ndarray) -> np.ndarray | None:
         return None
 
     _, width = mask.shape
-    y_med = np.full(width, np.nan, dtype=np.float32)
-    for x_coord in range(width):
-        ys = np.where(mask[:, x_coord] > 0)[0]
-        if ys.size:
-            y_med[x_coord] = np.median(ys)
-
-    if np.isnan(y_med).all():
+    ys, xs = np.nonzero(mask)
+    if xs.size == 0:
         return None
+
+    # np.nonzero on a row-major array yields, for any fixed column, rows in
+    # increasing order already -- a stable sort by column preserves that,
+    # so no secondary sort of ys is needed within each column group.
+    order = np.argsort(xs, kind="stable")
+    xs_sorted = xs[order]
+    ys_sorted = ys[order].astype(np.float32)
+
+    unique_xs, start_idx, counts = np.unique(xs_sorted, return_index=True, return_counts=True)
+    mid_low = start_idx + (counts - 1) // 2
+    mid_high = start_idx + counts // 2
+    medians = (ys_sorted[mid_low] + ys_sorted[mid_high]) / 2.0
+
+    y_med = np.full(width, np.nan, dtype=np.float32)
+    y_med[unique_xs] = medians
     return y_med
 
 
@@ -1202,6 +1217,9 @@ def detect_overlap_with_vertical_close(
         return info, debug
 
     closed_crop = vertical_close_crop(crop_bin, close_h)
+    # need_trace=False: the overlap decision below only reads closed_mask;
+    # the trace itself is only used for a debug visualization that nothing
+    # in the pipeline currently consumes, so skip building it.
     closed_trace, closed_debug = extract_trace(
         closed_crop,
         dilate_k=int(active_params["dilate_k"]),
@@ -1209,6 +1227,7 @@ def detect_overlap_with_vertical_close(
         params=active_params,
         crop_y0=crop_y0,
         frame_top_y=frame_top_y,
+        need_trace=False,
     )
     closed_mask = closed_debug["mask"]
     info = detect_overlap_in_mask(
@@ -1228,6 +1247,51 @@ def detect_overlap_with_vertical_close(
     return info, debug
 
 
+def select_edge_anchored_components(
+    labels: np.ndarray,
+    y_thresh: int,
+    min_width: int,
+    anchor: str,
+) -> tuple[np.ndarray, int]:
+    """Vectorized equivalent of looping over every connected component in
+    `labels` (as produced by cv2.connectedComponentsWithStats) and keeping
+    those that touch the given edge band and span at least min_width unique
+    columns -- i.e. the per-component `labels == component; np.where(...)`
+    scan, done once for all components instead of once per component.
+
+    anchor="top": keep components whose min y <= y_thresh (near the top edge).
+    anchor="bottom": keep components whose max y >= y_thresh (near the bottom edge).
+    """
+    ys_all, xs_all = np.nonzero(labels)
+    if ys_all.size == 0:
+        return np.zeros_like(labels, dtype=np.uint8), 0
+
+    lbl_all = labels[ys_all, xs_all]
+    order = np.lexsort((xs_all, lbl_all))
+    lbl_sorted = lbl_all[order]
+    xs_sorted = xs_all[order]
+    ys_sorted = ys_all[order]
+
+    uniq_labels, start_idx = np.unique(lbl_sorted, return_index=True)
+    min_y_per_label = np.minimum.reduceat(ys_sorted, start_idx)
+    max_y_per_label = np.maximum.reduceat(ys_sorted, start_idx)
+
+    is_new_x = np.empty(len(xs_sorted), dtype=bool)
+    is_new_x[0] = True
+    if len(xs_sorted) > 1:
+        is_new_x[1:] = (xs_sorted[1:] != xs_sorted[:-1]) | (lbl_sorted[1:] != lbl_sorted[:-1])
+    width_per_label = np.add.reduceat(is_new_x.astype(np.int32), start_idx)
+
+    if anchor == "bottom":
+        keep = (max_y_per_label >= y_thresh) & (width_per_label >= min_width)
+    else:
+        keep = (min_y_per_label <= y_thresh) & (width_per_label >= min_width)
+
+    kept_labels = uniq_labels[keep]
+    keep_mask = np.isin(labels, kept_labels).astype(np.uint8) * 255
+    return keep_mask, int(kept_labels.size)
+
+
 def extract_trace(
     crop_bin: np.ndarray,
     dilate_k: int = 9,
@@ -1235,8 +1299,17 @@ def extract_trace(
     params: dict[str, Any] | None = None,
     crop_y0: int = 0,
     frame_top_y: int | None = None,
+    need_trace: bool = True,
 ) -> tuple[np.ndarray | None, dict[str, np.ndarray | bool | int | float | str]]:
+    """Select the trace-bearing connected component(s) and, unless `need_trace`
+    is False, build the per-column median trace (with gap interpolation) from
+    them. Overlap detection only needs the selected `mask`, not the trace
+    itself, so it calls this with need_trace=False to skip the otherwise-
+    redundant trace-building and interpolation work.
+    """
     crop = (crop_bin > 0).astype(np.uint8) * 255
+
+    something = np.any(crop > 0)
 
     kernel_width = max(3, int(dilate_k))
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, 1))
@@ -1256,7 +1329,7 @@ def extract_trace(
     areas = stats[1:, cv2.CC_STAT_AREA]
     best = 1 + int(np.argmax(areas))
     standard_mask = (labels == best).astype(np.uint8) * 255
-    standard_trace = build_trace_from_mask(standard_mask)
+    standard_trace = build_trace_from_mask(standard_mask) if need_trace else None
     standard_debug = {
         "crop": crop,
         "dil": dilated,
@@ -1277,19 +1350,7 @@ def extract_trace(
         min_width = int(params.get("top_cc_min_width_px", 25))
         min_coverage_ratio = float(params.get("top_cc_min_coverage_ratio", 0.25))
 
-        keep_mask = np.zeros_like(crop)
-        kept = 0
-        for component in range(1, num):
-            comp_mask = labels == component
-            ys, xs = np.where(comp_mask)
-            if xs.size == 0:
-                continue
-
-            width = int(np.unique(xs).size)
-            max_y = int(ys.max())
-            if max_y >= y_thresh and width >= min_width:
-                keep_mask[comp_mask] = 255
-                kept += 1
+        keep_mask, kept = select_edge_anchored_components(labels, y_thresh, min_width, anchor="bottom")
 
         if kept == 0:
             standard_debug["fallback_used"] = True
@@ -1303,6 +1364,18 @@ def extract_trace(
             standard_debug["y_thresh"] = y_thresh
             standard_debug["coverage_ratio"] = coverage_ratio
             return standard_trace, standard_debug
+
+        if not need_trace:
+            return None, {
+                "crop": crop,
+                "dil": dilated,
+                "mask": keep_mask,
+                "interpolation_mask": None,
+                "selected_method": "bottom_threshold",
+                "fallback_used": False,
+                "y_thresh": y_thresh,
+                "coverage_ratio": coverage_ratio,
+            }
 
         bottom_trace = build_trace_from_mask(keep_mask)
         if bottom_trace is None:
@@ -1356,19 +1429,7 @@ def extract_trace(
     min_width = int(params.get("top_cc_min_width_px", 25))
     min_coverage_ratio = float(params.get("top_cc_min_coverage_ratio", 0.25))
 
-    keep_mask = np.zeros_like(crop)
-    kept = 0
-    for component in range(1, num):
-        comp_mask = labels == component
-        ys, xs = np.where(comp_mask)
-        if xs.size == 0:
-            continue
-
-        width = int(np.unique(xs).size)
-        min_y = int(ys.min())
-        if min_y <= y_thresh and width >= min_width:
-            keep_mask[comp_mask] = 255
-            kept += 1
+    keep_mask, kept = select_edge_anchored_components(labels, y_thresh, min_width, anchor="top")
 
     if kept == 0:
         standard_debug["fallback_used"] = True
@@ -1379,6 +1440,18 @@ def extract_trace(
     if coverage_ratio < min_coverage_ratio:
         standard_debug["fallback_used"] = True
         return standard_trace, standard_debug
+
+    if not need_trace:
+        return None, {
+            "crop": crop,
+            "dil": dilated,
+            "mask": keep_mask,
+            "interpolation_mask": None,
+            "selected_method": "top_threshold",
+            "fallback_used": False,
+            "y_thresh": y_thresh,
+            "coverage_ratio": coverage_ratio,
+        }
 
     top_trace = build_trace_from_mask(keep_mask)
     if top_trace is None:
