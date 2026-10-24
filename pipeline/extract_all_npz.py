@@ -257,12 +257,19 @@ def main() -> None:
         default=default_worker_count(),
         help="Number of worker processes to use per dataset. Use 1 to disable parallelism.",
     )
+    parser.add_argument(
+        "--preset",
+        choices=sorted(ed.PRESETS),
+        default="original",
+        help="Extraction preset. 'original' is the pipeline behind data/extracted/mitral_images; "
+        "'black165_stable_sep' is the black filter + stability separator (data/extracted/mitral_images_blackfilter_stableseparator).",
+    )
     args = parser.parse_args()
 
     root = args.root.resolve()
     output_root = args.output_dir.resolve()
     datasets = args.dataset or DATASET_FOLDERS
-    params = dict(ed.DEFAULT_PARAMS)
+    params = ed.get_params(args.preset)
 
     output_root.mkdir(parents=True, exist_ok=True)
     for dataset in datasets:

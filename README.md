@@ -1,217 +1,117 @@
-# MLCV ECG Digitization
+# ECG Digitization
 
-This is the working project for paper-ECG digitization, anomaly annotation, and downstream dataset preparation.
+Converts scanned 12-lead paper ECGs into calibrated digital waveforms (`.npz`), and records where the signal is unreliable
+via two aligned artifact masks:
 
-The core of the project is a custom ECG waveform extraction pipeline that converts scanned 12-lead ECG images into aligned digital signals, while also tracking two important artifact channels:
-- `overlap_mask`: columns/samples affected by detected overlap anomalies
-- `interpolated_mask`: columns/samples where the waveform was inferred by interpolation
+- `overlap_mask`: samples affected by a detected overlap anomaly (traces crossing text or each other)
+- `interpolated_mask`: samples inferred by explicit recovery logic rather than observed
 
-## What This Project Contains
+Its outputs feed the downstream mitral valve classifier in `../mitral_classification/`. For the research overview see
+`../RESEARCH_INDEX.md`. Some paths below (`experiments/`, `docs/`, `benchmarks/`, `archive/`, annotation logs) exist only in the local
+workspace: this repository's `.gitignore` excludes them.
 
-At a high level, this project combines five related activities:
-- waveform digitization and calibration
-- anomaly annotation with a GUI workflow
-- analysis of merged annotation logs
-- experimental branches for improving extraction quality
-- benchmarking against an external reference implementation
+## Quick start
 
-The main reusable implementation is [`pipeline/ecg_digitizer.py`](./pipeline/ecg_digitizer.py). The main notebook for inspection and debugging is [`pipeline/ecg_waveform_extraction.ipynb`](./pipeline/ecg_waveform_extraction.ipynb).
+The workspace uses one shared uv environment at the workspace root (`../pyproject.toml`): run `uv sync` once, then
+
+```bash
+# from the workspace root (MLCV/)
+uv run python ecg_digitization/pipeline/extract_all_npz.py --dataset mitral_images --limit 10 --output-dir /tmp/test_out
+```
+
+Single image from Python:
+
+```python
+import sys; sys.path.insert(0, "ecg_digitization/pipeline")
+import ecg_digitizer as ed
+params = ed.get_params("black165_stable_sep")      # or "original"
+result = ed.digitize_ecg_image("path/to/scan.png", params)
+```
+
+## Extraction versions
+
+Three extraction versions, each a self-contained copy of the digitizer in its own folder (same downstream code, same `.npz` format). Output of the older versions is reproduced bit for bit (checked on 40 scans each; see "Checks").
+
+| Version | Folder / preset | Ink mask and separators | Lead trace |
+|---|---|---|---|
+| v1 | `pipeline/original/`, preset `original` (also the canonical `pipeline/ecg_digitizer.py`) | Red-grid whitening + dark-hybrid mask; morphology-based column separators | per-column median of the selected component |
+| v2 | `pipeline/bfss/`, preset `black165_stable_sep_repair` (default); `black165_stable_sep` without the repair | Darkness threshold (HSV V <= 165) + per-image redness gate + border-line stripper; cross-row stability separator detector, with repair of a missed or wrong separator | per-column median |
+| v3 | `pipeline/bfss_tracker/`, preset `black165_stable_sep_repair_tracker` | as v2 | column-wise beam-search tracker: follows the trace through overlapping strokes and marks the samples it had to interpolate |
+
+Why v2: low-resolution scans (~1130x554 px against ~2528x1230 px for the same form) lose much of their trace with v1. The black filter plus the stability separator raised the mean valid-window fraction from 0.846 to 0.912 and removed samples with a completely empty lead (5.81% to 0%). Why v3: where traces of neighbouring leads or text overlap, the median trace jumps onto the wrong stroke; the tracker stays on the lead's own trace.
+
+Optional, v3 only: `OVERLAP_TRACKER_FAST=1` uses a numba-compiled tracker (`overlap_tracker_fast.py`, identical paths; needs `numba`). The opt-in preset `black165_stable_sep_repair_tracker_adaptive` (`pipeline/bfss_tracker/layout_adaptive/`) reads layouts other than 3x4 + rhythm strip; sheets in the standard layout take the unchanged v3 path. It was validated on synthetic sheets only (see its README).
+
+Speed (v2 / v3, output identical to earlier code): about 60 ms per scan for the digitizer on a desktop CPU; on a free Kaggle machine (4 vCPU) the digitizer takes 151 / 160 ms per scan and the whole image-to-probabilities chain about 0.22 / 0.23 s with a T4 GPU.
+
+### Checks
+Arrays `signal_matrix`, `overlap_mask`, `interpolated_mask` equal to the stored extractions on 40 evenly spaced scans each: `original` (canonical file and `pipeline/original/`) against the v1 export, `black165_stable_sep` (canonical file, `pipeline/bfss/`, `pipeline/bfss_tracker/`) against the v2 export without repair. The speed-ups of `pipeline/bfss/` and `pipeline/bfss_tracker/` were checked as identical on 2252 exports of 563 scans.
 
 ## Layout
 
-- `pipeline/`: main reusable digitization code (script + notebook)
-- `annotation/`: annotation GUI, log migration tooling, annotation logs, and merged analysis
-
-### `pipeline/`
-
-- `pipeline/ecg_digitizer.py`: main reusable digitization pipeline
-- `pipeline/ecg_waveform_extraction.ipynb`: notebook version of the main pipeline with visual debugging
-- `pipeline/extract_all_npz.py`: batch exporter that digitizes all datasets into `.npz` files
-
-### `annotation/`
-
-- `annotation/ecg_annotation_gui.py`: annotation GUI that runs the current digitizer and saves anomaly labels
-- `annotation/migrate_annotation_logs.py`: utility for normalizing and importing annotation logs
-- `annotation/logs/`: GUI annotation outputs, lead-level anomaly snapshots, and annotation logs (was `anomalous_images/`)
-- `annotation/analysis/`: merged annotation CSVs and simple analysis artifacts (was `anomaly_analysis/`)
+- `pipeline/`
+  - `ecg_digitizer.py`: reusable pipeline (library API, both presets)
+  - `bfss_tracker/`: v3, copy of `bfss/` whose lead trace comes from the overlap beam tracker (default preset `black165_stable_sep_repair_tracker`; optional numba tracker and adaptive layout; see its README)
+  - `original/` (v1), `bfss/` (v2): self-contained peer copies of the digitizer + extraction script (`bfss` default preset `black165_stable_sep_repair`)
+  - `extract_all_npz.py`: batch exporter for all datasets (`--preset`, `--dataset`, `--limit`, `--overwrite`, `--workers`, `--output-dir`)
+  - `ecg_waveform_extraction.ipynb`: notebook for visual debugging; implements the `original` behavior only (it does not use the presets)
+- `annotation/`: manual anomaly-annotation GUI (`ecg_annotation_gui.py`), log migration tool, logs and analysis (local only; EF datasets)
+- `experiments/`: dated investigations, each with its own findings file (local only; see `../research/experiment_registry.md`, IDs A1 to A12)
+- `benchmarks/`: comparison against an external reference implementation (local only, undocumented)
+- `docs/`: reference papers (local only)
+- `archive/`: example single-run output
 
 ## Datasets
 
-Currently uses three image datasets:
+Raw scans live in `../data/raw/`; see `../research/data_manifest.md` for extraction versions and provenance.
 
-- `0_normal_EF/`: `1949` images
-- `1_reduced_EF/`: `402` images
-- `mitral_images/`: `5626` images
+| Folder | Images | Role |
+|---|---|---|
+| `mitral_images/` | 5626 | Mitral valve task (the research focus) |
+| `0_normal_EF/`, `1_reduced_EF/` | 1949, 402 | Ejection-fraction cohorts, annotated with the GUI; not part of the current research scope |
 
-### 1. `0_normal_EF/`
-Used for the normal-ejection-fraction cohort in the EF task.
+## Pipeline stages
 
-### 2. `1_reduced_EF/`
-Used for the reduced-ejection-fraction cohort in the EF task.
+1. Preprocess the scan into a binary ink mask (preset dependent, see above).
+2. Detect the four baseline rows and the three vertical separators of the 3x4 lead layout.
+3. Crop the 12 short leads and the long rhythm strip.
+4. Extract a 1-D trace from each crop (`extract_trace`: dilate, keep the largest connected component).
+5. Recover clipped short-lead crops by adaptively expanding the crop height.
+6. Recover clipped rhythm-strip crops with rhythm-specific bottom-threshold logic.
+7. Interpolate the portions of the waveform that have explicit recovery logic.
+8. Detect overlap anomalies on the selected trace mask.
+9. Calibrate pixel traces into time and voltage units.
+10. Export the canonical signal arrays and aligned masks.
 
-### 3. `mitral_images/`
-Used for a separate mitral-regurgitation task. This workspace shares the digitization tools with that dataset, but the downstream modeling work for mitral classification is intentionally documented elsewhere.
+### Calibration
 
+Fixed standard assumption, not estimated from the printed grid: 25 mm/s and 10 mm/mV. The code assumes the usable width is 10.0 s and
+`voltage_time_ratio_mV_per_ms = 0.0025`.
 
-## Main Digitization Pipeline
+### Rhythm strip
 
-There are two main entry points:
+A first-class output with its own crop and recovery path; it participates in overlap and interpolation masks. Exported Lead II comes
+from the rhythm strip, not from the short-lead II slot.
 
-- [`pipeline/ecg_digitizer.py`](./pipeline/ecg_digitizer.py): reusable script/API implementation
-- [`pipeline/ecg_waveform_extraction.ipynb`](./pipeline/ecg_waveform_extraction.ipynb): notebook version for inspection, visualization, and one-off debugging
+### Overlap detection
 
-The notebook and script are intended to stay behaviorally consistent. The notebook exists because many extraction failures are easiest to understand visually.
+Vertical closing (height 7) on the local mask; a lead or rhythm strip counts as overlapping when detected overlap columns exceed 3.
+The exported `overlap_mask` is thresholded: only leads judged globally overlapping keep nonzero samples.
 
-### Pipeline Stages
+### Interpolation
 
-The current pipeline, in broad terms, does the following:
+Limited to places with explicit recovery logic (top-row short leads clipped at the top border; the rhythm strip clipped at the bottom
+border). The `interpolated_mask` is sparse by design and is not a generic smoothing mask.
 
-1. preprocess the ECG image and suppress the red grid/background
-2. detect the four baseline rows and the three vertical separators of the 3x4 lead layout
-3. crop the 12 short leads and the long rhythm strip
-4. extract a 1D waveform trace from each crop
-5. recover clipped short-lead crops by adaptively expanding vertical crop height when needed
-6. recover clipped rhythm-strip crops with rhythm-specific bottom-threshold logic when the signal is cut by the bottom image boundary
-7. interpolate specific missing portions of the waveform where the pipeline has explicit recovery logic
-8. detect overlap anomalies on the selected trace mask
-9. calibrate pixel traces into time and voltage units
-10. export canonical signal arrays and aligned masks
+## Output format (`.npz`)
 
-### Calibration Assumptions
+- one array per lead (`I`, `II`, `III`, `aVR`, `aVL`, `aVF`, `V1` to `V6`)
+- `signal_matrix` (5000 x 12), `overlap_mask` (5000 x 12), `interpolated_mask` (5000 x 12)
+- `lead_order`, `t_ms`, `meta`
+- conventions: 2 ms sampling, 10 s duration, voltage in uV; per-lead NaN outside the lead's own 2.5 s window is by design (except Lead II)
 
-The pipeline currently uses a **fixed standard ECG calibration assumption**, not an image-derived grid calibration.
+## Annotation GUI
 
-Assumed standard:
-- `25 mm/s`
-- `10 mm/mV`
-
-Implementation-wise, the code assumes:
-- total usable width corresponds to `10.0` seconds
-- `voltage_time_ratio_mV_per_ms = 0.0025`
-
-That is consistent with standard ECG paper settings, but it is still an assumption. The pipeline does **not** currently estimate paper speed or gain directly from the printed grid.
-
-### Rhythm Strip Handling
-
-The rhythm strip is treated as a first-class output, not just a plotting artifact.
-
-Current behavior:
-- it has its own crop and its own recovery path
-- it participates in overlap detection
-- it participates in interpolation-mask generation
-- exported Lead `II` in the canonical 12-lead output comes from the rhythm strip, not from the short-lead `II` slot
-
-### Overlap Detection
-
-The current main overlap detector uses a vertical-closing-based local mask followed by a fixed anomaly threshold.
-
-Current main settings:
-- vertical closing height: `1x7`
-- anomaly decision: a lead/rhythm strip is considered overlapping if detected overlap columns are `> 3`
-
-The exported `overlap_mask` is **thresholded**:
-- local overlap columns are projected to the canonical time axis
-- but only leads judged globally overlapping by the current main rule keep nonzero overlap samples in the exported mask
-
-### Interpolation Logic
-
-The current pipeline also tracks where signal values were inferred rather than directly observed.
-
-Interpolation is currently limited to the places where the pipeline has explicit recovery logic:
-- top-row short leads with top-border clipping logic
-- rhythm strip with bottom-border clipping logic
-
-This is why the exported `interpolated_mask` is sparse by design. It is not a generic smoothing mask; it only marks samples that were actually inferred by recovery logic.
-
-## Output Formats
-
-### Notebook Single-Run Output
-
-The notebook writes example single-run output into `archive/`:
-- `archive/digitised_ecg.csv`
-- `archive/digitised_ecg.npz`
-
-The CSV is useful for inspection, but the `.npz` is the main machine-readable export.
-
-### NPZ Export Schema
-
-The current `.npz` export contains:
-- one array per lead (`I`, `II`, `III`, `aVR`, `aVL`, `aVF`, `V1`-`V6`)
-- `signal_matrix`: canonical `5000 x 12` matrix
-- `overlap_mask`: canonical `5000 x 12` binary mask aligned to `signal_matrix`
-- `interpolated_mask`: canonical `5000 x 12` binary mask aligned to `signal_matrix`
-- `lead_order`
-- `t_ms`
-- `meta`
-
-Important export conventions:
-- canonical sampling interval is `2 ms`
-- canonical duration is `10 seconds`
-- voltage unit in exported arrays is `uV`
-- `overlap_mask` is thresholded by the main overlap decision
-- `interpolated_mask` only marks values that were inferred by explicit interpolation logic
-
-## Batch Extraction
-
-[`pipeline/extract_all_npz.py`](./pipeline/extract_all_npz.py) batch-processes all datasets in `../data/raw/` and writes `.npz` files into [`../data/extracted/`](../data/extracted/).
-
-Output layout:
-- [`../data/extracted/0_normal_EF`](../data/extracted/0_normal_EF)
-- [`../data/extracted/1_reduced_EF`](../data/extracted/1_reduced_EF)
-- [`../data/extracted/mitral_images`](../data/extracted/mitral_images)
-
-Each output filename matches the image stem, for example:
-- `B002305.jpg -> B002305.npz`
-- `A012599.jpg -> A012599.npz`
-
-Typical usage (defaults now point at `../data/raw/` and `../data/extracted/` automatically):
-
-```bash
-python pipeline/extract_all_npz.py
-```
-
-Useful options:
-
-```bash
-python pipeline/extract_all_npz.py --dataset 0_normal_EF --overwrite
-python pipeline/extract_all_npz.py --dataset 1_reduced_EF --limit 10
-python pipeline/extract_all_npz.py --dataset mitral_images
-```
-
-## Annotation Workflow
-
-Manual anomaly labeling is handled by [`annotation/ecg_annotation_gui.py`](./annotation/ecg_annotation_gui.py).
-
-### What the GUI Does
-
-The GUI:
-- browses ECG images from `../data/raw/`
-- runs the current digitization pipeline on demand
-- shows multiple synchronized visual views of the extracted result
-- lets annotators tag anomalies
-- writes persistent logs under [`annotation/logs/`](./annotation/logs/)
-
-
-### Manual Anomaly Categories
-
-The GUI supports four manual anomaly categories:
-- `Overlap with Text`
-- `Overlap of Signals`
-- `Broken Signal`
-- `Others`
-
-These manual labels are separate from the automatic `overlap_mask` and `interpolated_mask` produced by the digitizer.
-
-### GUI Visual Views
-
-The current GUI includes dedicated tabs for:
-- `Y-Trace Views`
-- `Lead Crops`
-- `Overlap Views`
-- `Interpolation Views`
-
-The GUI also includes:
-- rhythm-strip visualizations
-- highlighted overlap detections
-- highlighted interpolation detections
-- a small automatic summary showing which leads were flagged by the current pipeline
+`annotation/ecg_annotation_gui.py` browses raw scans, runs the digitizer on demand, shows Y-trace, lead-crop, overlap and interpolation
+views, and lets an annotator tag `Overlap with Text`, `Overlap of Signals`, `Broken Signal` or `Others`. Manual labels are separate from
+the automatic masks. Logs are written under `annotation/logs/`.

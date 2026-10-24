@@ -61,7 +61,32 @@ DEFAULT_PARAMS: dict[str, Any] = {
     "rhythm_overlap_ratio_threshold": 0.008,
     "overlap_vertical_close_h": 7,
     "overlap_column_count_threshold": 3,
+    # --- opt-in alternative extraction (defaults keep the original behavior exactly) ---
+    "ink_filter": "original",  # "original" (red-grid whitening + hybrid mask) or "black_redness_gate" (darkness threshold, redness gate, border stripper)
+    "simple_black_thresh": 165,  # HSV-V upper bound for ink; only used when ink_filter="black_redness_gate"
+    "simple_black_border_margin_frac": 0.02,
+    "simple_black_border_coverage_thresh": 0.5,
+    "separator_method": "morphology",  # "morphology" (original detect_column_separators) or "stability" (cross-row stability detector)
 }
+
+# Named parameter presets. "original" is the pipeline used for data/extracted/mitral_images.
+# "black165_stable_sep" reproduces data/extracted/mitral_images_blackfilter_stableseparator
+# (see ecg_digitization/experiments/simple_black_filter/ for the investigation behind it).
+PRESETS: dict[str, dict[str, Any]] = {
+    "original": {},
+    "black165_stable_sep": {
+        "ink_filter": "black_redness_gate",
+        "simple_black_thresh": 165,
+        "separator_method": "stability",
+    },
+}
+
+
+def get_params(preset: str = "original", overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    """DEFAULT_PARAMS + a named preset + optional overrides."""
+    if preset not in PRESETS:
+        raise ValueError(f"Unknown preset {preset!r}; choose from {sorted(PRESETS)}")
+    return {**DEFAULT_PARAMS, **PRESETS[preset], **(overrides or {})}
 
 LEAD_LAYOUT = [
     ["I", "aVR", "V1", "V4"],
@@ -147,7 +172,13 @@ def digitize_ecg_image(image_path: str | Path, params: dict[str, Any] | None = N
     if len(baselines) < 3:
         raise ValueError(f"Expected at least 3 baselines, found {len(baselines)}")
 
-    separators = detect_column_separators(ink, baselines, height, width, p)
+    separator_method = str(p.get("separator_method", "morphology"))
+    if separator_method == "stability":
+        separators = detect_column_separators_stability(img, baselines, height, width, p)
+    elif separator_method == "morphology":
+        separators = detect_column_separators(ink, baselines, height, width, p)
+    else:
+        raise ValueError(f"Unknown separator_method: {separator_method}")
     bounds, rhythm, lead_results, rhythm_crop_box = extract_lead_results_with_recovery(
         img,
         ink,
@@ -630,6 +661,11 @@ def build_dark_hybrid_ink_mask(img_bgr: np.ndarray, params: dict[str, Any]) -> n
 
 
 def preprocess_for_digitization(img_bgr: np.ndarray, params: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    ink_filter = str(params.get("ink_filter", "original"))
+    if ink_filter == "black_redness_gate":
+        return preprocess_simple_black(img_bgr, params)
+    if ink_filter != "original":
+        raise ValueError(f"Unknown ink_filter: {ink_filter}")
     mode = str(params.get("preprocess_mode", "current"))
     whitened = whiten_red_grid(img_bgr, params)
     if mode == "current":
@@ -640,6 +676,65 @@ def preprocess_for_digitization(img_bgr: np.ndarray, params: dict[str, Any]) -> 
         filtered[ink > 0] = (0, 0, 0)
         return filtered, ink
     raise ValueError(f"Unknown preprocess_mode: {mode}")
+
+
+def build_ink_mask_with_redness_gate(img_bgr: np.ndarray, v_thresh: int = 165) -> np.ndarray:
+    """Ink = darker than v_thresh (HSV V) AND not reddish. The redness cutoff is self-calibrated per image
+    (Otsu on red_excess = R - max(G, B) restricted to the dark pixels), which excludes dark printed grid on
+    scans from other sources. See experiments/simple_black_filter/FINDINGS.md."""
+    b, g, r = cv2.split(img_bgr)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    v = hsv[:, :, 2]
+    red_excess = r.astype(np.int16) - np.maximum(g, b).astype(np.int16)
+
+    dark = v <= v_thresh
+    candidates = np.clip(red_excess[dark], 0, 255).astype(np.uint8)
+    if candidates.size == 0 or candidates.max() == candidates.min():
+        return dark.astype(np.uint8) * 255
+    otsu_thr, _ = cv2.threshold(candidates, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    red_excess_clip = np.clip(red_excess, 0, 255).astype(np.uint8)
+    non_reddish = red_excess_clip <= otsu_thr
+    return (dark & non_reddish).astype(np.uint8) * 255
+
+
+def strip_border_lines_by_density(mask: np.ndarray, margin_frac: float = 0.02, coverage_thresh: float = 0.5) -> np.ndarray:
+    """Remove printed border lines: rows/columns within a narrow edge margin whose ink coverage exceeds
+    coverage_thresh (a pure density test, so a border line cannot hide by touching interior ink)."""
+    height, width = mask.shape
+    margin_h = max(3, int(margin_frac * height))
+    margin_w = max(3, int(margin_frac * width))
+    border = np.zeros_like(mask)
+
+    row_cov = (mask > 0).mean(axis=1)
+    for band in (slice(0, margin_h), slice(height - margin_h, height)):
+        rows = np.where(row_cov[band] >= coverage_thresh)[0]
+        if band.start != 0:
+            rows = rows + band.start
+        border[rows, :] = mask[rows, :]
+
+    col_cov = (mask > 0).mean(axis=0)
+    for band in (slice(0, margin_w), slice(width - margin_w, width)):
+        cols = np.where(col_cov[band] >= coverage_thresh)[0]
+        if band.start != 0:
+            cols = cols + band.start
+        border[:, cols] = mask[:, cols]
+
+    return cv2.bitwise_and(mask, cv2.bitwise_not(border))
+
+
+def preprocess_simple_black(img_bgr: np.ndarray, params: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Alternative to the whitening + hybrid ink mask (ink_filter="black_redness_gate")."""
+    v_thresh = int(params.get("simple_black_thresh", 165))
+    margin_frac = float(params.get("simple_black_border_margin_frac", 0.02))
+    coverage_thresh = float(params.get("simple_black_border_coverage_thresh", 0.5))
+
+    mask = build_ink_mask_with_redness_gate(img_bgr, v_thresh)
+    ink = strip_border_lines_by_density(mask, margin_frac, coverage_thresh)
+
+    filtered = np.full_like(img_bgr, 255)
+    filtered[ink > 0] = (0, 0, 0)
+    return filtered, ink
 
 
 def detect_baselines(ink: np.ndarray, height: int, width: int, params: dict[str, Any]) -> list[int]:
@@ -779,6 +874,81 @@ def detect_separators_in_row(row_img: np.ndarray, row_h: int, params: dict[str, 
     open_h = max(10, int(0.35 * row_h))
     open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, open_h))
     return cv2.morphologyEx(row_closed, cv2.MORPH_OPEN, open_kernel, iterations=1)
+
+
+_STAB_DARK_THRESHOLD = 100  # HSV-V (max(B,G,R)) below this counts as very dark ink
+_STAB_MIN_MEAN_COUNT_RATIO = 0.15  # candidate column needs this fraction of window height as mean dark-pixel count
+_STAB_MIN_SEPARATION_PX = 30  # candidates closer than this to an already-picked one are the same mark
+_STAB_X_MARGIN_LEFT = 0.10  # ignore the left frame/border
+_STAB_X_MARGIN_RIGHT = 0.90  # ignore the calibration-pulse boundary near the right edge
+_STAB_MIN_GAP_RATIO = 0.15  # reject implausibly crowded separators (fraction of width)
+_STAB_MAX_GAP_RATIO_SKEW = 2.5  # reject implausibly uneven spacing (largest gap / smallest gap)
+
+
+def detect_column_separators_stability(
+    raw_image_bgr: np.ndarray,
+    baselines: list[int],
+    height: int,
+    width: int,
+    params: dict[str, Any],
+) -> list[float]:
+    """Cross-row-stability column separator detector (separator_method="stability").
+
+    A printed separator mark is the same fixed ink in each of the three baseline-row windows, while trace ink
+    varies between rows and periodic gridlines are not concentrated at exactly three columns. Candidate columns
+    are ranked by low cross-row variability, then by strength. Works on the raw image (not the ink mask), so it is
+    independent of the ink filter. Falls back to equal spacing when the result is implausible.
+    Validated at 0 px error on 18/18 hand-checked images (experiments/simple_black_filter/SEPARATOR_DETECTION_FINDINGS.md).
+    """
+    baselines_3 = baselines[:3]
+    if len(baselines_3) < 3:
+        raise ValueError("Need three baselines to detect column separators")
+
+    vd = float(np.mean(np.diff(baselines_3))) if len(baselines_3) >= 2 else height / 4
+    halfspan = int(float(params["crop_halfspan_ratio"]) * vd)
+
+    row_counts = []
+    for baseline in baselines_3:
+        y0 = max(0, int(baseline - halfspan))
+        y1 = min(height, int(baseline + halfspan))
+        band = raw_image_bgr[y0:y1, :]
+        v = band.max(axis=2)
+        dark = (v < _STAB_DARK_THRESHOLD).astype(np.int32)
+        row_counts.append(dark.sum(axis=0))
+    row_counts = np.array(row_counts)
+    mean_count = row_counts.mean(axis=0)
+    std_count = row_counts.std(axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        coeff_var = np.where(mean_count > 5, std_count / np.maximum(mean_count, 1e-6), 999.0)
+
+    x0, x1 = int(_STAB_X_MARGIN_LEFT * width), int(_STAB_X_MARGIN_RIGHT * width)
+    min_mean_count = max(15, _STAB_MIN_MEAN_COUNT_RATIO * (2 * halfspan))
+    candidates = [
+        (x, mean_count[x], coeff_var[x])
+        for x in range(x0, x1)
+        if mean_count[x] >= min_mean_count
+    ]
+    candidates.sort(key=lambda t: (t[2], -t[1]))  # most stable first, tie-break by strength
+
+    needed = int(params["num_cols"]) - 1
+    picked: list[int] = []
+    for x, _mean, _cv in candidates:
+        if all(abs(x - px) > _STAB_MIN_SEPARATION_PX for px in picked):
+            picked.append(x)
+        if len(picked) >= needed:
+            break
+    picked.sort()
+
+    if len(picked) < needed:
+        return fallback_separators(width, params)
+
+    gaps = [picked[i + 1] - picked[i] for i in range(len(picked) - 1)]
+    if gaps and min(gaps) < _STAB_MIN_GAP_RATIO * width:
+        return fallback_separators(width, params)
+    if gaps and max(gaps) / min(gaps) > _STAB_MAX_GAP_RATIO_SKEW:
+        return fallback_separators(width, params)
+
+    return [float(x) for x in picked]
 
 
 def fallback_separators(width: int, params: dict[str, Any]) -> list[float]:
