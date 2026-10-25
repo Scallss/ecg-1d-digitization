@@ -24,7 +24,7 @@ Single image from Python:
 ```python
 import sys; sys.path.insert(0, "ecg_digitization/pipeline")
 import ecg_digitizer as ed
-params = ed.get_params("black165_stable_sep")      # or "original"
+params = ed.get_params("black165_stable_sep_repair")      # v2; or "original", "black165_stable_sep_repair_tracker"
 result = ed.digitize_ecg_image("path/to/scan.png", params)
 ```
 
@@ -35,7 +35,7 @@ Three extraction versions, each a self-contained copy of the digitizer in its ow
 | Version | Folder / preset | Ink mask and separators | Lead trace |
 |---|---|---|---|
 | v1 | `pipeline/original/`, preset `original` (also the canonical `pipeline/ecg_digitizer.py`) | Red-grid whitening + dark-hybrid mask; morphology-based column separators | per-column median of the selected component |
-| v2 | `pipeline/bfss/`, preset `black165_stable_sep_repair` (default); `black165_stable_sep` without the repair | Darkness threshold (HSV V <= 165) + per-image redness gate + border-line stripper; cross-row stability separator detector, with repair of a missed or wrong separator | per-column median |
+| v2 | `pipeline/bfss/`, preset `black165_stable_sep_repair` (default) | Darkness threshold (HSV V <= 165) + per-image redness gate + border-line stripper; cross-row stability separator detector, with repair of a missed or wrong separator | per-column median |
 | v3 | `pipeline/bfss_tracker/`, preset `black165_stable_sep_repair_tracker` | as v2 | column-wise beam-search tracker: follows the trace through overlapping strokes and marks the samples it had to interpolate |
 
 Why v2: low-resolution scans (~1130x554 px against ~2528x1230 px for the same form) lose much of their trace with v1. The black filter plus the stability separator raised the mean valid-window fraction from 0.846 to 0.912 and removed samples with a completely empty lead (5.81% to 0%). Why v3: where traces of neighbouring leads or text overlap, the median trace jumps onto the wrong stroke; the tracker stays on the lead's own trace.
@@ -45,12 +45,12 @@ Optional, v3 only: `OVERLAP_TRACKER_FAST=1` uses a numba-compiled tracker (`over
 Speed (v2 / v3, output identical to earlier code): about 60 ms per scan for the digitizer on a desktop CPU; on a free Kaggle machine (4 vCPU) the digitizer takes 151 / 160 ms per scan and the whole image-to-probabilities chain about 0.22 / 0.23 s with a T4 GPU.
 
 ### Checks
-Arrays `signal_matrix`, `overlap_mask`, `interpolated_mask` equal to the stored extractions on 40 evenly spaced scans each: `original` (canonical file and `pipeline/original/`) against the v1 export, `black165_stable_sep` (canonical file, `pipeline/bfss/`, `pipeline/bfss_tracker/`) against the v2 export without repair. The speed-ups of `pipeline/bfss/` and `pipeline/bfss_tracker/` were checked as identical on 2252 exports of 563 scans.
+Arrays `signal_matrix`, `overlap_mask`, `interpolated_mask` equal to the stored extractions on 40 evenly spaced scans each: `original` (canonical file and `pipeline/original/`) against the v1 export, the v2 code (canonical file, `pipeline/bfss/`, `pipeline/bfss_tracker/`) against the stored v2 export made before the separator repair was added. The speed-ups of `pipeline/bfss/` and `pipeline/bfss_tracker/` were checked as identical on 2252 exports of 563 scans.
 
 ## Layout
 
 - `pipeline/`
-  - `ecg_digitizer.py`: reusable pipeline (library API, both presets)
+  - `ecg_digitizer.py`: reusable pipeline (library API; v1 and v2)
   - `bfss_tracker/`: v3, copy of `bfss/` whose lead trace comes from the overlap beam tracker (default preset `black165_stable_sep_repair_tracker`; optional numba tracker and adaptive layout; see its README)
   - `original/` (v1), `bfss/` (v2): self-contained peer copies of the digitizer + extraction script (`bfss` default preset `black165_stable_sep_repair`)
   - `extract_all_npz.py`: batch exporter for all datasets (`--preset`, `--dataset`, `--limit`, `--overwrite`, `--workers`, `--output-dir`)
